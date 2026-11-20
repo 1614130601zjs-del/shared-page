@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GG公益站 Playground 断线缓存补发助手
 // @namespace    pg-cache-companion
-// @version      1.0.1
-// @description  配合 GG公益站 Playground Executor 使用：自动缓存最新一条 Google 完整响应、支持断线续收、断线丢结果后一键补发，不影响原脚本自动更新。
+// @version      1.0.2
+// @description  配合 GG公益站 Playground Executor 使用：自动缓存 Google 响应，兼容 AI Studio 嵌套数组文本提取，并支持断线续收与缓存补发。
 // @match        https://aistudio.google.com/*
 // @run-at       document-start
 // @inject-into  content
@@ -207,36 +207,106 @@
 
 
     function extractCachedText(raw) {
-        const source = String(raw || "").trim().replace(/^\\)\\]}'\\s*/, "");
+        const original = String(raw || "");
+        const source = original.trim().replace(/^\)\]\}'\s*/, "");
         const roots = [];
-        try { roots.push(JSON.parse(source)); } catch (_) {
-            for (const line of source.split(/\\r?\\n/)) {
-                const part = line.trim().replace(/^\\)\\]}'\\s*/, "");
+
+        try {
+            roots.push(JSON.parse(source));
+        } catch (_) {
+            // 兼容按行分隔的 JSON 响应
+            for (const line of source.split(/\r?\n/)) {
+                const part = line.trim().replace(/^\)\]\}'\s*/, "");
                 if (!part) continue;
                 try { roots.push(JSON.parse(part)); } catch (_) {}
             }
         }
-        const texts = [];
-        const seen = new Set();
-        function walk(value, depth = 0) {
-            if (depth > 14 || value == null || typeof value !== "object") return;
-            if (Array.isArray(value)) { for (const item of value) walk(item, depth + 1); return; }
+
+        // 先兼容标准 Gemini candidates 响应
+        const standardTexts = [];
+        function walkStandard(value, depth = 0) {
+            if (depth > 24 || value == null || typeof value !== "object") return;
+            if (Array.isArray(value)) {
+                for (const item of value) walkStandard(item, depth + 1);
+                return;
+            }
             if (Array.isArray(value.candidates)) {
                 for (const candidate of value.candidates) {
                     for (const part of candidate?.content?.parts || []) {
-                        if (typeof part?.text === "string" && !seen.has(part.text)) {
-                            seen.add(part.text);
-                            texts.push(part.text);
-                        }
+                        if (typeof part?.text === "string" && part.text) standardTexts.push(part.text);
                     }
                 }
             }
             for (const [key, child] of Object.entries(value)) {
-                if (key !== "candidates") walk(child, depth + 1);
+                if (key !== "candidates") walkStandard(child, depth + 1);
             }
         }
-        for (const root of roots) walk(root);
-        return texts.length ? { text: texts.join(""), parsed: true } : { text: String(raw || ""), parsed: false };
+        for (const root of roots) walkStandard(root);
+        if (standardTexts.length) {
+            return { text: standardTexts.join(""), parsed: true, format: "gemini" };
+        }
+
+        // AI Studio GenerateContent 使用嵌套数组；文本块通常表现为 [null, "文本"]。
+        // 按原数组遍历顺序收集，不去重，避免误删模型连续输出的重复片段。
+        const wireTexts = [];
+        function walkWire(value, depth = 0) {
+            if (depth > 32 || value == null || typeof value !== "object") return;
+            if (!Array.isArray(value)) {
+                for (const child of Object.values(value)) walkWire(child, depth + 1);
+                return;
+            }
+            if (value.length === 2 && value[0] === null && typeof value[1] === "string") {
+                const text = value[1];
+                if (text && !/^(?:model|user|assistant|system)$/i.test(text.trim())) {
+                    wireTexts.push(text);
+                }
+                return;
+            }
+            for (const child of value) walkWire(child, depth + 1);
+        }
+        for (const root of roots) walkWire(root);
+        if (wireTexts.length) {
+            return { text: wireTexts.join(""), parsed: true, format: "aistudio-wire" };
+        }
+
+        // 断线时 JSON 可能只写入了一部分，整段 JSON.parse 会失败。
+        // 仍尝试从已收到的原始字节中恢复完整的 [null, "文本片段"]。
+        const recovered = [];
+        const pairPattern = /\[\s*null\s*,\s*"/g;
+        let match;
+        while ((match = pairPattern.exec(source))) {
+            const quoteStart = pairPattern.lastIndex - 1;
+            let escaped = false;
+            let quoteEnd = -1;
+            for (let i = quoteStart + 1; i < source.length; i++) {
+                const ch = source[i];
+                if (escaped) {
+                    escaped = false;
+                    continue;
+                }
+                if (ch === "\\") {
+                    escaped = true;
+                    continue;
+                }
+                if (ch === '"') {
+                    quoteEnd = i;
+                    break;
+                }
+            }
+            if (quoteEnd < 0) break;
+            try {
+                const value = JSON.parse(source.slice(quoteStart, quoteEnd + 1));
+                if (typeof value === "string" && value && !/^(?:model|user|assistant|system)$/i.test(value.trim())) {
+                    recovered.push(value);
+                }
+            } catch (_) {}
+            pairPattern.lastIndex = quoteEnd + 1;
+        }
+        if (recovered.length) {
+            return { text: recovered.join(""), parsed: true, format: "aistudio-wire-partial" };
+        }
+
+        return { text: original, parsed: false, format: "raw" };
     }
 
     async function copyCachedText() {
