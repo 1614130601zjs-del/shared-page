@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GG公益站 Playground 断线缓存补发助手
 // @namespace    pg-cache-companion
-// @version      1.0.3
-// @description  配合 GG公益站 Playground Executor 使用：自动缓存 Google 响应，兼容 AI Studio 嵌套数组文本提取；按请求模型匹配缓存，支持断线续收与补发。
+// @version      1.0.4
+// @description  配合 GG公益站 Playground Executor 使用：缓存完整原始响应体，IndexedDB 持久化，按请求模型匹配补发；文本解析仅用于查看和复制。
 // @match        https://aistudio.google.com/*
 // @run-at       document-start
 // @inject-into  content
@@ -120,8 +120,11 @@
     const W = window;
     const WS_PATH_RE = /\/api\/playground\/ws(?:$|\?)/i;
     const GENERATE_MATCH = "MakerSuiteService/GenerateContent";
-    const CACHE_MAX_MEM_BYTES = 10 * 1024 * 1024;   // 内存缓存上限 10MB
-    const CACHE_MAX_STORE_BYTES = 3 * 1024 * 1024;  // localStorage 持久化上限 3MB
+    const CACHE_MAX_MEM_BYTES = 10 * 1024 * 1024;   // 单条原始响应缓存上限 10MB
+    const CACHE_MAX_STORE_BYTES = 3 * 1024 * 1024;  // IndexedDB 不可用时的 localStorage 兜底上限 3MB
+    const CACHE_DB_NAME = "pg-cache-companion";
+    const CACHE_DB_VERSION = 1;
+    const CACHE_DB_STORE = "responses";
     const STREAM_CHUNK_SIZE = 4096; // 旧版直推协议保留兼容，不再用于缓存补发
     const MAX_WS_BUFFERED = 1024 * 1024;
     const REQUEST_TTL_MS = 15 * 60 * 1000;
@@ -141,7 +144,8 @@
         noticeLevel: "info",     // info | ok | warn | err
         collapsed: false,
         wsConnected: false,
-        replayPending: null
+        replayPending: null,
+        cacheLoading: true
     };
 
     const pendingRequests = new Map(); // requestId -> { model, stream, ts }
@@ -166,7 +170,61 @@
         return Math.floor(m / 60) + "小时前";
     }
 
-    function loadPersistedState() {
+    // 优先使用 IndexedDB 保存完整原始响应体；localStorage 只作小缓存兜底。
+    // 这样不再受 3MB localStorage 上限限制，10MB 内的长回复刷新后也可恢复。
+    let cacheDbPromise = null;
+    function openCacheDB() {
+        if (!("indexedDB" in W)) return Promise.reject(new Error("IndexedDB 不可用"));
+        if (cacheDbPromise) return cacheDbPromise;
+        cacheDbPromise = new Promise((resolve, reject) => {
+            const req = W.indexedDB.open(CACHE_DB_NAME, CACHE_DB_VERSION);
+            req.onupgradeneeded = () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains(CACHE_DB_STORE)) {
+                    db.createObjectStore(CACHE_DB_STORE);
+                }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error || new Error("打开缓存数据库失败"));
+            req.onblocked = () => reject(new Error("缓存数据库被其他页面占用"));
+        });
+        return cacheDbPromise;
+    }
+
+    async function idbGetCache() {
+        const db = await openCacheDB();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(CACHE_DB_STORE, "readonly");
+            const req = tx.objectStore(CACHE_DB_STORE).get("latest");
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => reject(req.error || new Error("读取缓存失败"));
+        });
+    }
+
+    async function idbPutCache(entry) {
+        const db = await openCacheDB();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(CACHE_DB_STORE, "readwrite");
+            tx.objectStore(CACHE_DB_STORE).put(entry, "latest");
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => reject(tx.error || new Error("写入缓存失败"));
+            tx.onabort = () => reject(tx.error || new Error("缓存写入中止"));
+        });
+    }
+
+    async function idbDeleteCache() {
+        const db = await openCacheDB();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(CACHE_DB_STORE, "readwrite");
+            tx.objectStore(CACHE_DB_STORE).delete("latest");
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => reject(tx.error || new Error("清除缓存失败"));
+            tx.onabort = () => reject(tx.error || new Error("清除缓存中止"));
+        });
+    }
+
+    async function loadPersistedState() {
+        const loadStartedAt = Date.now();
         try {
             const raw = localStorage.getItem(STORE_KEYS.cache);
             if (raw) {
@@ -184,11 +242,29 @@
         try {
             state.collapsed = localStorage.getItem(STORE_KEYS.collapsed) === "true";
         } catch (_) {}
+
+        try {
+            const stored = await idbGetCache();
+            if (stored && typeof stored.body === "string" && stored.body.length > 0 &&
+                (!state.replayCache || Number(stored.ts) > Number(state.replayCache.ts))) {
+                state.replayCache = stored;
+            }
+        } catch (_) {
+            // IndexedDB 不可用时继续使用 localStorage 兜底缓存。
+        } finally {
+            state.cacheLoading = false;
+            updateUI();
+        }
     }
 
-    function saveReplayCache(model, body, status = 200) {
+    async function saveReplayCache(model, body, status = 200) {
         const text = String(body || "");
-        if (!text || text.length > CACHE_MAX_MEM_BYTES) return;
+        if (!text || text.length > CACHE_MAX_MEM_BYTES) {
+            if (text.length > CACHE_MAX_MEM_BYTES) {
+                setNotice("⚠️ 响应超过 10MB，未写入缓存", "warn");
+            }
+            return;
+        }
         const entry = {
             ts: Date.now(),
             model: String(model || ""),
@@ -196,12 +272,33 @@
             body: text
         };
         state.replayCache = entry;
-        if (text.length <= CACHE_MAX_STORE_BYTES) {
-            try {
-                localStorage.setItem(STORE_KEYS.cache, JSON.stringify(entry));
-            } catch (_) {}
+        updateUI();
+
+        let persisted = false;
+        try {
+            await idbPutCache(entry);
+            persisted = true;
+            // 小缓存额外留一份 localStorage 镜像，便于 IndexedDB 暂时不可用时兜底。
+            if (text.length <= CACHE_MAX_STORE_BYTES) {
+                try { localStorage.setItem(STORE_KEYS.cache, JSON.stringify(entry)); } catch (_) {}
+            } else {
+                try { localStorage.removeItem(STORE_KEYS.cache); } catch (_) {}
+            }
+        } catch (_) {
+            if (text.length <= CACHE_MAX_STORE_BYTES) {
+                try {
+                    localStorage.setItem(STORE_KEYS.cache, JSON.stringify(entry));
+                    persisted = true;
+                } catch (_) {}
+            }
         }
-        setNotice(`✅ 已缓存最新回复（${fmtBytes(text.length)}）`, "ok");
+
+        setNotice(
+            persisted
+                ? `✅ 已缓存完整原始响应（${fmtBytes(text.length)}，可刷新恢复）`
+                : `⚠️ 已暂存原始响应（${fmtBytes(text.length)}），但浏览器持久化失败；刷新前请勿关闭页面`,
+            persisted ? "ok" : "warn"
+        );
         updateUI();
     }
 
@@ -377,6 +474,7 @@
         try {
             localStorage.removeItem(STORE_KEYS.cache);
         } catch (_) {}
+        void idbDeleteCache().catch(() => {});
         setNotice("缓存已清空", "info");
         updateUI();
     }
@@ -470,9 +568,12 @@
                         return;
                     }
                     clone.text().then((text) => {
-                        if (!text || !text.trim() || text.length < 20) return;
-                        const model = reqModel || (lastRequestMeta && lastRequestMeta.model) || "";
-                        saveReplayCache(model, text, resp.status || 200);
+                        if (!text || !text.trim()) return;
+                        const activeMeta = lastRequestMeta &&
+                            (!state.replayPending || lastRequestMeta.requestId === state.replayPending.requestId)
+                            ? lastRequestMeta : null;
+                        const model = reqModel || (activeMeta && activeMeta.model) || "";
+                        void saveReplayCache(model, text, resp.status || 200);
                     }).catch(() => {});
                 }).catch(() => {});
             }
@@ -1088,15 +1189,21 @@
             ui.pillText.textContent = "缓存补发";
             ui.replayBtn.disabled = true;
             ui.replayBtn.className = "btn";
-            ui.replayBtn.textContent = "暂无缓存";
+            ui.replayBtn.textContent = state.cacheLoading ? "正在读取缓存…" : "暂无缓存";
         }
 
         ui.clearBtn.disabled = !c;
         ui.copyBtn.disabled = !c;
         ui.viewBtn.disabled = !c;
         ui.meta.textContent = c
-            ? `已缓存 ${fmtBytes(c.body.length)} · ${fmtAge(c.ts)}${c.model ? " · " + c.model : ""}`
-            : "暂无缓存（成功收到回复后自动保存最新一条）";
+            ? `已缓存原始响应 ${fmtBytes(c.body.length)} · ${fmtAge(c.ts)}${c.model ? " · " + c.model : ""}`
+            : state.cacheLoading
+                ? "正在读取持久化缓存…"
+                : "暂无缓存（完整收到成功响应后自动保存最新一条）";
+        if (state.cacheLoading) {
+            ui.replayBtn.disabled = true;
+            ui.clearBtn.disabled = true;
+        }
 
         if (state.noticeText) {
             ui.notice.style.display = "block";
@@ -1130,7 +1237,7 @@
 
     // ==================== 启动 ====================
 
-    loadPersistedState();
+    void loadPersistedState();
     ensureFetchHook();
     installWebSocketHook();
     installRouteWatch();
