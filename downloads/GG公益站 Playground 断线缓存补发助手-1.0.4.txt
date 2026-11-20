@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GG公益站 Playground 断线缓存补发助手
 // @namespace    pg-cache-companion
-// @version      1.0.4
+// @version      1.0.5
 // @description  配合 GG公益站 Playground Executor 使用：缓存完整原始响应体，IndexedDB 持久化，按请求模型匹配补发；文本解析仅用于查看和复制。
 // @match        https://aistudio.google.com/*
 // @run-at       document-start
@@ -125,7 +125,7 @@
     const CACHE_DB_NAME = "pg-cache-companion";
     const CACHE_DB_VERSION = 1;
     const CACHE_DB_STORE = "responses";
-    const STREAM_CHUNK_SIZE = 4096; // 旧版直推协议保留兼容，不再用于缓存补发
+    const STREAM_CHUNK_SIZE = 4096; // WebSocket 流式补发分块大小
     const MAX_WS_BUFFERED = 1024 * 1024;
     const REQUEST_TTL_MS = 15 * 60 * 1000;
 
@@ -159,6 +159,10 @@
         if (n < 1024) return n + " B";
         if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
         return (n / 1024 / 1024).toFixed(2) + " MB";
+    }
+
+    function normalizeModel(value) {
+        return String(value || "").trim().replace(/^models\//, "");
     }
 
     function fmtAge(ts) {
@@ -519,44 +523,6 @@
                 } catch (_) {}
             }
 
-            // 不再绕过执行器直接向 WebSocket 发送 stream-chunk/response。
-            // 将缓存伪装成一次正常的 Google Fetch 响应，让 Executor 自己完成
-            // 流式读取、stream-chunk/stream-end、非流式 response 及请求清理。
-            if (isGenerate && state.replayPending && state.replayCache) {
-                const pending = state.replayPending;
-                const cache = state.replayCache;
-                const pendingAge = Date.now() - Number(pending.ts || 0);
-
-                if (pendingAge > REQUEST_TTL_MS) {
-                    state.replayPending = null;
-                    setNotice("⚠️ 补发请求等待超时，请重新点击补发", "warn");
-                    updateUI();
-                } else if (pending.model && cache.model && pending.model !== cache.model) {
-                    state.replayPending = null;
-                    setNotice("⚠️ 当前请求模型 " + pending.model + " 与缓存模型 " + cache.model + " 不一致，未补发", "warn");
-                    updateUI();
-                } else if (!reqModel) {
-                    // 无法从请求体确认模型时不注入，避免误替换页面初始化或其他请求。
-                } else if ((pending.model && pending.model !== reqModel) || (cache.model && cache.model !== reqModel)) {
-                    // 可能是页面初始化或其他模型请求；保留 pending，等待真正匹配的 GenerateContent。
-                } else {
-                    state.replayPending = null;
-                    setNotice("⚡ 已将匹配的缓存交给执行器（" + fmtBytes(cache.body.length) + "）", "ok");
-                    updateUI();
-                    try {
-                        return Promise.resolve(new Response(cache.body, {
-                            status: cache.status || 200,
-                            headers: {
-                                "content-type": "application/json+protobuf; charset=UTF-8"
-                            }
-                        }));
-                    } catch (err) {
-                        setNotice("❌ 构造缓存响应失败：" + ((err && err.message) || err), "err");
-                        updateUI();
-                    }
-                }
-            }
-
             const promise = fn.apply(this, arguments);
             if (isGenerate && promise && typeof promise.then === "function") {
                 promise.then((resp) => {
@@ -720,13 +686,20 @@
                             if (rid) {
                                 lastRequestMeta = { requestId: rid, model, stream, ts: Date.now() };
                                 if (state.replayArmed && state.replayCache) {
-                                    // 让 Playground Executor 正常处理 request；
-                                    // 等它发起真正的 GenerateContent Fetch 时再替换响应。
-                                    state.replayArmed = false;
-                                    state.replayPending = { requestId: rid, model, stream, ts: Date.now() };
-                                    pendingRequests.set(rid, { model, stream, ts: Date.now() });
-                                    setNotice("⚡ 已匹配下一条请求，等待执行器发起 Google 请求…", "info");
-                                    updateUI();
+                                    // 在 Executor 收到 request 之前直接从 WS 回传缓存，
+                                    // 不再依赖 fetch 包装层是否被 Executor 绕过。
+                                    const cachedModel = normalizeModel(state.replayCache.model);
+                                    const requestModel = normalizeModel(model);
+                                    if (cachedModel && requestModel && cachedModel !== requestModel) {
+                                        setNotice("⚠️ 当前请求模型 " + model + " 与缓存模型 " + state.replayCache.model + " 不一致，未补发；开关仍保持开启", "warn");
+                                        updateUI();
+                                    } else {
+                                        state.replayArmed = false;
+                                        intercepted = true;
+                                        setNotice("⚡ 已拦截匹配请求，正在通过 WebSocket 回传原始缓存…", "info");
+                                        updateUI();
+                                        void replayToServer(ws, origSend, rid, stream);
+                                    }
                                 } else {
                                     pendingRequests.set(rid, { model, stream, ts: Date.now() });
                                 }
